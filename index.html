@@ -297,6 +297,7 @@ table.hosts tr:hover td{background:var(--surface-2)}
         <button id="zoomFitBtn" title="全体を画面に収める" aria-label="fit to view">⤢</button>
         <hr>
         <button id="freezeBtn" title="配置を固定して動かなくする" aria-label="freeze layout">⏸</button>
+        <button id="topoUndoBtn" title="系統図での直前の移動を元に戻す" aria-label="undo move" disabled>↶</button>
       </div>
     </div>
 
@@ -420,6 +421,8 @@ var layoutMode = 'force'; // 'force' | 'grid'
 state.linkOverrides = [];  // edge keys ("a|b") whose auto-detected link the user severed
 state.subnetOrder = [];    // ordered /24 keys, left-to-right in grid layout (user-reorderable)
 state.nodeOrder = {};      // nodeId -> row order within its /24 column in grid layout (user-reorderable)
+state.topoPos = {};        // /24 key -> {x,y}: 系統図モードで箱(またはハブ)をドラッグして動かした位置の上書き
+state.topoNodePos = {};    // ノードid -> {x,y}: 系統図モードで個別のホストをドラッグして動かした位置の上書き
 
 function toast(msg){
   var t = document.getElementById('toast');
@@ -441,7 +444,8 @@ function saveLocal(){
       }),
       manualLinks: state.manualLinks, files: Array.from(state.files), sample: state.sample,
       linkOverrides: state.linkOverrides, autoConnectRouters: autoConnectRouters,
-      subnetOrder: state.subnetOrder, nodeOrder: state.nodeOrder, layoutMode: layoutMode
+      subnetOrder: state.subnetOrder, nodeOrder: state.nodeOrder, layoutMode: layoutMode,
+      topoPos: state.topoPos, topoNodePos: state.topoNodePos
     };
     localStorage.setItem('nmapmap_v1', JSON.stringify(plain));
   }catch(e){ /* storage unavailable - ignore, in-memory state still works */ }
@@ -466,6 +470,8 @@ function loadLocal(){
     autoConnectRouters = !!plain.autoConnectRouters;
     state.subnetOrder = plain.subnetOrder || [];
     state.nodeOrder = plain.nodeOrder || {};
+    state.topoPos = plain.topoPos || {};
+    state.topoNodePos = plain.topoNodePos || {};
     layoutMode = (plain.layoutMode === 'grid' || plain.layoutMode === 'topology') ? plain.layoutMode : 'force';
     return state.hosts.size > 0;
   }catch(e){ return false; }
@@ -912,6 +918,28 @@ function commitGridOrderFromPositions(g){
 /* ---------------- topology layout: /24 ごとの箱 + ルーター同士を樹形図でつなぐ系統図 ---------------- */
 var TOPO = { boxWidth:200, colGutter:90, topMargin:90, dotSpacingX:56, dotSpacingY:46, dotCols:3, boxPadTop:38, boxPadBottom:24, hubLabelClearance:64, rowGap:60, minRowHeight:230 };
 var lastTopoNodes = null; // { nwNode, boxes:[{sk,x,y,w,h}] } - used by fitToView() and PPT export captions
+var topoUndoStack = []; // 系統図での位置変更(箱/個別ノードのドラッグ)を戻すための操作履歴。ブラウザのセッション内のみ有効
+
+/* 系統図でのドラッグ操作をUndoスタックに積む。prev が null/undefined なら「元々は自動配置だった」ことを表す */
+function pushTopoUndo(entry){
+  topoUndoStack.push(entry);
+  if (topoUndoStack.length > 60) topoUndoStack.shift();
+  var btn = document.getElementById('topoUndoBtn');
+  if (btn) btn.disabled = false;
+}
+function undoTopoMove(){
+  var entry = topoUndoStack.pop();
+  if (!entry) return;
+  if (entry.type === 'topoPos'){
+    if (entry.prev) state.topoPos[entry.sk] = entry.prev; else delete state.topoPos[entry.sk];
+  } else if (entry.type === 'topoNodePos'){
+    if (entry.prev) state.topoNodePos[entry.id] = entry.prev; else delete state.topoNodePos[entry.id];
+  }
+  var btn = document.getElementById('topoUndoBtn');
+  if (btn) btn.disabled = topoUndoStack.length === 0;
+  saveLocal(); render();
+  toast('直前の移動を元に戻しました');
+}
 
 /* サブネット同士の隣接関係から、NW(仮想の最上位ノード)を根とする木構造を組み立てる。
    buildGraph() が返す/24単位の橋渡し(uplink/autolink/manual)を使い、循環があっても
@@ -978,7 +1006,9 @@ function computeTopologyLayout(g){
 
   var posById = new Map();
   hroot.each(function(n){
-    posById.set(n.data.id, { x: n.x + xOffset, y: TOPO.topMargin + (maxY - n.y) });
+    var sk = n.data.id;
+    var override = state.topoPos[sk];
+    posById.set(sk, override ? { x: override.x, y: override.y } : { x: n.x + xOffset, y: TOPO.topMargin + (maxY - n.y) });
   });
 
   var nodeIndex = g.nodeIndex;
@@ -1006,6 +1036,8 @@ function computeTopologyLayout(g){
 
     if (hubNode){ hubNode.x = pos.x; hubNode.y = pos.y; hubNode.fx = pos.x; hubNode.fy = pos.y; }
     others.forEach(function(nd, i){
+      var ov = state.topoNodePos[nd.id];
+      if (ov){ nd.x = ov.x; nd.y = ov.y; nd.fx = ov.x; nd.fy = ov.y; return; }
       var col = i % TOPO.dotCols, row = Math.floor(i / TOPO.dotCols);
       var gridW = (TOPO.dotCols-1) * TOPO.dotSpacingX;
       var x = (pos.x - gridW/2) + col*TOPO.dotSpacingX;
@@ -1108,6 +1140,16 @@ function render(){
   var w = document.getElementById('stage').clientWidth || 600;
   var h = document.getElementById('stage').clientHeight || 500;
   var topoBoxes = [];
+  /* 箱に属するホストのうち、個別にドラッグして固定された(state.topoNodePos持ち)ものは
+     箱(またはハブ)ごと動かしたときに一緒に引きずらない(すでに自分で決めた位置を尊重する) */
+  function topoGroupNodesFor(sk){
+    var list = (g.subnets.get(sk) || []).map(function(rec){ return g.nodeIndex.get(rec.ip); }).filter(Boolean);
+    list = list.filter(function(nd){ return !state.topoNodePos[nd.id]; });
+    var hubId = g.hubOf.get(sk);
+    var hubNode = g.nodeIndex.get(hubId);
+    if (hubNode && list.indexOf(hubNode) === -1) list.push(hubNode);
+    return list;
+  }
 
   if (layoutMode === 'grid'){
     if (sim){ sim.stop(); sim = null; }
@@ -1156,17 +1198,44 @@ function render(){
   if (layoutMode === 'topology'){
     var box = boxG.selectAll('rect.subnetBox').data(topoBoxes, function(d){ return d.sk; });
     box.exit().remove();
-    var boxEnter = box.enter().append('rect').attr('class','subnetBox').attr('rx',10).attr('ry',10);
-    box.merge(boxEnter)
+    var boxEnter = box.enter().append('rect').attr('class','subnetBox').attr('rx',10).attr('ry',10).style('cursor','grab');
+    var boxMerged = box.merge(boxEnter)
       .attr('x', function(d){ return d.x; }).attr('y', function(d){ return d.y; })
       .attr('width', function(d){ return d.w; }).attr('height', function(d){ return d.h; });
 
     var boxLabel = boxG.selectAll('text.subnetBoxLabel').data(topoBoxes, function(d){ return d.sk; });
     boxLabel.exit().remove();
     var boxLabelEnter = boxLabel.enter().append('text').attr('class','subnetBoxLabel').attr('text-anchor','middle');
-    boxLabel.merge(boxLabelEnter)
+    var boxLabelMerged = boxLabel.merge(boxLabelEnter)
       .attr('x', function(d){ return d.x + d.w/2; }).attr('y', function(d){ return d.y - 10; })
       .text(function(d){ return d.sk; });
+
+    /* 箱をドラッグすると、その/24のルーター/ハブと中のホストも一緒に動かして好きな位置に並べ替えられる
+       (箱の中身=ホストの配置はそのまま、箱全体の位置だけが自由になる) */
+    boxMerged.call(d3.drag()
+      .on('start', function(ev, d){
+        d._dragNodes = topoGroupNodesFor(d.sk);
+        d._undoPrev = state.topoPos[d.sk] || null;
+        d3.select(this).style('cursor','grabbing').raise();
+      })
+      .on('drag', function(ev, d){
+        d.x += ev.dx; d.y += ev.dy;
+        d3.select(this).attr('x', d.x).attr('y', d.y);
+        boxLabelMerged.filter(function(b){ return b.sk === d.sk; }).attr('x', d.x + d.w/2).attr('y', d.y - 10);
+        (d._dragNodes || []).forEach(function(nd){ nd.x += ev.dx; nd.y += ev.dy; nd.fx = nd.x; nd.fy = nd.y; });
+        ticked();
+      })
+      .on('end', function(ev, d){
+        var hubId = g.hubOf.get(d.sk);
+        var hubNode = g.nodeIndex.get(hubId);
+        if (hubNode){
+          state.topoPos[d.sk] = { x: hubNode.x, y: hubNode.y };
+          pushTopoUndo({ type:'topoPos', sk:d.sk, prev:d._undoPrev });
+        }
+        d._dragNodes = null;
+        d3.select(this).style('cursor','grab');
+        saveLocal();
+      }));
   } else {
     boxG.selectAll('rect,text').remove();
   }
@@ -1223,9 +1292,30 @@ function render(){
       .on('mousemove', function(ev,d){ moveTip(ev); })
       .on('mouseleave', hideTip)
       .call(d3.drag()
-        .on('start', function(ev,d){ if (layoutMode==='topology') return; if (layoutMode==='force' && sim && !ev.active) sim.alphaTarget(0.25).restart(); d.fx=d.x; d.fy=d.y; hideTip(); })
+        .on('start', function(ev,d){
+          if (layoutMode==='topology'){
+            var posKey = d.type==='nw' ? 'NW_ROOT' : (g.hubOf.get(d.subnet)===d.id ? d.subnet : null);
+            if (posKey !== null){ d._dragNodes = topoGroupNodesFor(posKey); d._undoPrev = state.topoPos[posKey] || null; }
+            else { d._undoPrev = state.topoNodePos[d.id] || null; }
+            hideTip();
+            return;
+          }
+          if (layoutMode==='force' && sim && !ev.active) sim.alphaTarget(0.25).restart(); d.fx=d.x; d.fy=d.y; hideTip();
+        })
         .on('drag', function(ev,d){
-          if (layoutMode==='topology') return;
+          if (layoutMode==='topology'){
+            var posKey = d.type==='nw' ? 'NW_ROOT' : (g.hubOf.get(d.subnet)===d.id ? d.subnet : null);
+            if (posKey !== null){
+              (d._dragNodes||[]).forEach(function(nd){ nd.x += ev.dx; nd.y += ev.dy; nd.fx = nd.x; nd.fy = nd.y; });
+              topoBoxes.forEach(function(b){ if (b.sk===posKey){ b.x += ev.dx; b.y += ev.dy; } });
+              boxG.selectAll('rect.subnetBox').filter(function(b){ return b.sk===posKey; }).attr('x', function(b){return b.x;}).attr('y', function(b){return b.y;});
+              boxG.selectAll('text.subnetBoxLabel').filter(function(b){ return b.sk===posKey; }).attr('x', function(b){return b.x+b.w/2;}).attr('y', function(b){return b.y-10;});
+            } else {
+              d.x += ev.dx; d.y += ev.dy; d.fx = d.x; d.fy = d.y;
+            }
+            ticked();
+            return;
+          }
           if (layoutMode==='grid'){
             var isHeader = g.hubOf.get(d.subnet) === d.id;
             if (isHeader){ d.fx = ev.x; d.fy = GRID.headerY; d.x = d.fx; d.y = d.fy; }
@@ -1234,7 +1324,19 @@ function render(){
           } else { d.fx=ev.x; d.fy=ev.y; }
         })
         .on('end', function(ev,d){
-          if (layoutMode==='topology') return;
+          if (layoutMode==='topology'){
+            var posKey = d.type==='nw' ? 'NW_ROOT' : (g.hubOf.get(d.subnet)===d.id ? d.subnet : null);
+            if (posKey !== null){
+              state.topoPos[posKey] = { x:d.x, y:d.y };
+              pushTopoUndo({ type:'topoPos', sk:posKey, prev:d._undoPrev });
+            } else {
+              state.topoNodePos[d.id] = { x:d.x, y:d.y };
+              pushTopoUndo({ type:'topoNodePos', id:d.id, prev:d._undoPrev });
+            }
+            d._dragNodes = null;
+            saveLocal();
+            return;
+          }
           if (layoutMode==='grid'){
             commitGridOrderFromPositions(g);
             saveLocal(); render();
@@ -1258,6 +1360,10 @@ function render(){
   }
 
   if (selectedId && !g.nodes.some(function(n){ return n.id===selectedId; })){ selectedId=null; renderInspector(null); }
+
+  var topoUndoBtn = document.getElementById('topoUndoBtn');
+  topoUndoBtn.style.display = (layoutMode === 'topology') ? '' : 'none';
+  topoUndoBtn.disabled = topoUndoStack.length === 0;
 }
 
 /* re-style the existing DOM without rebuilding the simulation - used while typing a search */
@@ -1533,6 +1639,7 @@ document.getElementById('freezeBtn').addEventListener('click', function(e){
   e.target.classList.toggle('toggled', frozen);
   render();
 });
+document.getElementById('topoUndoBtn').addEventListener('click', undoTopoMove);
 document.getElementById('zoomInBtn').addEventListener('click', function(){ svg.transition().duration(200).call(zoomBehavior.scaleBy, 1.3); });
 document.getElementById('zoomOutBtn').addEventListener('click', function(){ svg.transition().duration(200).call(zoomBehavior.scaleBy, 1/1.3); });
 document.getElementById('zoomFitBtn').addEventListener('click', function(){ fitToView(250); });
